@@ -65,7 +65,7 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
 
 # States
 SET_APIKEY_STATE, WAITING_IMAGE, WAITING_REF_VIDEO, WAITING_PROMPT, WAITING_ORIENTATION, WAITING_DURATION = range(6)
-ADMIN_SELECT, ADMIN_INPUT, DELETE_KEY_SELECT = range(3)
+ADMIN_SELECT, ADMIN_INPUT, MANAGE_KEY_SELECT, MANAGE_KEY_ACTION = range(4)
 
 # =========================================================
 # HELPERS
@@ -239,9 +239,9 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
             BASE_URL = "https://api.freepik.com"
             
             # --- SMART RETRY LOGIC START ---
-            keys = db.get_all_apikeys(chat_id)
+            keys = db.get_active_apikeys(chat_id)
             if not keys:
-                await tg_retry(bot.send_message, chat_id, "❌ <b>Tidak ada API Key!</b>\nSilakan set key dulu.", parse_mode="HTML")
+                await tg_retry(bot.send_message, chat_id, "❌ <b>Tidak ada API Key Aktif!</b>\nSilakan cek menu 'Atur API Key'.", parse_mode="HTML")
                 return
 
             active_key = None
@@ -448,7 +448,7 @@ async def resume_pending_tasks(app):
         elif "2.6" in m_name: m_ver = "kling-2.6" 
 
         # Pick ANY valid key for polling (rotation not needed for checking status, just valid auth)
-        keys = db.get_all_apikeys(row["user_id"])
+        keys = db.get_active_apikeys(row["user_id"])
         if not keys: 
             db.remove_task(row["task_id"])
             continue
@@ -506,14 +506,16 @@ async def set_apikey_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keys = db.get_all_apikeys(q.from_user.id)
     count = len(keys)
+    active_count = len([k for k in keys if k.get('is_active', 1)])
     
     txt = f"🔑 <b>Manajemen API Key</b>\n"
-    txt += f"Jumlah Key: {count}/10\n\n"
+    txt += f"Total: {count}/10 | Aktif: {active_count}\n\n"
     
     if keys:
         for idx, k in enumerate(keys):
+            icon = "🟢" if k.get("is_active", 1) else "❄️"
             masked = f"....{k['api_key'][-6:]}" if len(k['api_key']) > 6 else k['api_key']
-            txt += f"{idx+1}. <code>{masked}</code>\n"
+            txt += f"{idx+1}. {icon} <code>{masked}</code>\n"
     else:
         txt += "❌ Belum ada API Key."
 
@@ -521,13 +523,13 @@ async def set_apikey_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if count < 10:
         kb.append([InlineKeyboardButton("➕ Tambah Key", callback_data="add_key_input")])
     if count > 0:
-        kb.append([InlineKeyboardButton("🗑 Hapus Key", callback_data="del_key_list")])
+        kb.append([InlineKeyboardButton("📂 Kelola Key", callback_data="manage_key_list")])
     kb.append([InlineKeyboardButton("🔙 Menu Utama", callback_data="back_home")])
     
     await tg_retry(q.edit_message_text, txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     return SET_APIKEY_STATE
 
-async def del_key_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def manage_key_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     keys = db.get_all_apikeys(q.from_user.id)
@@ -537,12 +539,50 @@ async def del_key_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     kb = []
     for k in keys:
+        icon = "🟢" if k.get("is_active", 1) else "❄️"
         masked = f"....{k['api_key'][-6:]}"
-        kb.append([InlineKeyboardButton(f"🗑 Hapus {masked}", callback_data=f"del_key_{k['id']}")])
-    kb.append([InlineKeyboardButton("🔙 Batal", callback_data="menu_apikey")])
+        kb.append([InlineKeyboardButton(f"{icon} Key {k['id']} ({masked})", callback_data=f"mng_key_{k['id']}")])
+    kb.append([InlineKeyboardButton("🔙 Kembali", callback_data="menu_apikey")])
     
-    await q.edit_message_text("👇 <b>Pilih Key untuk dihapus:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
-    return DELETE_KEY_SELECT
+    await q.edit_message_text("👇 <b>Pilih Key untuk dikelola:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    return MANAGE_KEY_SELECT
+
+async def manage_key_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    key_id = int(q.data.split("_")[-1])
+    # Fetch latest status
+    keys = db.get_all_apikeys(q.from_user.id)
+    target = next((k for k in keys if k["id"] == key_id), None)
+    
+    if not target:
+        await q.edit_message_text("❌ Key tidak ditemukan.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="manage_key_list")]]))
+        return MANAGE_KEY_SELECT
+
+    is_active = target.get("is_active", 1)
+    status_txt = "🟢 AKTIF" if is_active else "❄️ DIBEKUKAN"
+    info = f"🔑 <b>Detail Key {key_id}</b>\n\nStatus: {status_txt}\nKey: <code>{target['api_key']}</code>"
+    
+    kb = []
+    if is_active:
+        kb.append([InlineKeyboardButton("❄️ Bekukan (Freeze)", callback_data=f"freeze_{key_id}")])
+    else:
+        kb.append([InlineKeyboardButton("🟢 Aktifkan (Unfreeze)", callback_data=f"unfreeze_{key_id}")])
+    
+    kb.append([InlineKeyboardButton("🗑 Hapus Permanen", callback_data=f"del_key_{key_id}")])
+    kb.append([InlineKeyboardButton("🔙 Kembali", callback_data="manage_key_list")])
+    
+    await q.edit_message_text(info, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    return MANAGE_KEY_ACTION
+
+async def toggle_key_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action, key_id = q.data.split("_")
+    db.toggle_apikey(q.from_user.id, int(key_id), action == "unfreeze")
+    # Refresh view
+    q.data = f"mng_key_{key_id}"
+    return await manage_key_detail(update, context)
 
 async def del_key_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -553,7 +593,7 @@ async def del_key_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("✅ Key Dihapus!", show_alert=True)
     except:
         await q.answer("❌ Gagal.", show_alert=True)
-    return await set_apikey_start(update, context)
+    return await manage_key_list(update, context) # Back to list
 
 async def ask_key_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -604,8 +644,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pre_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not await check_auth(update) or not db.get_all_apikeys(q.from_user.id):
-        await q.answer("⛔ Akses Ditolak / API Key Kosong", show_alert=True)
+    if not await check_auth(update) or not db.get_active_apikeys(q.from_user.id):
+        await q.answer("⛔ Akses Ditolak / Tidak Ada Key Aktif (Cek Menu Key)", show_alert=True)
         return ConversationHandler.END
     context.user_data.clear()
     context.user_data["model"] = q.data.split("gen_", 1)[1]
@@ -704,12 +744,17 @@ def run_bot():
             SET_APIKEY_STATE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_apikey),
                 CallbackQueryHandler(ask_key_input, pattern="^add_key_input$"),
-                CallbackQueryHandler(del_key_list, pattern="^del_key_list$"),
+                CallbackQueryHandler(manage_key_list, pattern="^manage_key_list$"),
                 CallbackQueryHandler(set_apikey_start, pattern="^menu_apikey$")
             ],
-            DELETE_KEY_SELECT: [
-                CallbackQueryHandler(del_key_exec, pattern="^del_key_"),
+            MANAGE_KEY_SELECT: [
+                CallbackQueryHandler(manage_key_detail, pattern="^mng_key_"),
                 CallbackQueryHandler(set_apikey_start, pattern="^menu_apikey$")
+            ],
+            MANAGE_KEY_ACTION: [
+                CallbackQueryHandler(toggle_key_exec, pattern="^(freeze|unfreeze)_"),
+                CallbackQueryHandler(del_key_exec, pattern="^del_key_"),
+                CallbackQueryHandler(manage_key_list, pattern="^manage_key_list$")
             ],
             WAITING_IMAGE: [MessageHandler((filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND, get_img)],
             WAITING_REF_VIDEO: [MessageHandler((filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, get_vid)],

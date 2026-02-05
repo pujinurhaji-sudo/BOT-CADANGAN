@@ -28,6 +28,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             api_key TEXT,
+            is_active INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -61,7 +62,21 @@ def ensure_columns():
     finally:
         conn.close()
 
+def ensure_apikey_columns():
+    """Update tabel user_apikeys agar punya kolom is_active"""
+    conn = get_connection()
+    try:
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(user_apikeys)").fetchall()]
+        if "is_active" not in cols:
+            conn.execute("ALTER TABLE user_apikeys ADD COLUMN is_active INTEGER DEFAULT 1")
+            conn.commit()
+    except Exception as e:
+        print(f"Error ensure_apikey_columns: {e}")
+    finally:
+        conn.close()
+
 ensure_columns()
+ensure_apikey_columns()
 
 def register_user(user_id: int, full_name: str = "Unknown", username: str = None):
     conn = get_connection()
@@ -103,8 +118,25 @@ def add_apikey(user_id: int, api_key: str) -> bool:
 def get_all_apikeys(user_id: int):
     conn = get_connection()
     try:
-        rows = conn.execute("SELECT id, api_key FROM user_apikeys WHERE user_id = ? ORDER BY id ASC", (user_id,)).fetchall()
+        rows = conn.execute("SELECT id, api_key, is_active FROM user_apikeys WHERE user_id = ? ORDER BY id ASC", (user_id,)).fetchall()
+        return [{"id": r["id"], "api_key": r["api_key"], "is_active": r["is_active"]} for r in rows]
+    finally:
+        conn.close()
+
+def get_active_apikeys(user_id: int):
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT id, api_key FROM user_apikeys WHERE user_id = ? AND is_active = 1 ORDER BY id ASC", (user_id,)).fetchall()
         return [{"id": r["id"], "api_key": r["api_key"]} for r in rows]
+    finally:
+        conn.close()
+
+def toggle_apikey(user_id: int, key_id: int, make_active: bool):
+    conn = get_connection()
+    try:
+        val = 1 if make_active else 0
+        conn.execute("UPDATE user_apikeys SET is_active = ? WHERE user_id = ? AND id = ?", (val, user_id, key_id))
+        conn.commit()
     finally:
         conn.close()
 
