@@ -24,29 +24,32 @@ def init_db():
             joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             expiry_date TIMESTAMP
         )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS user_apikeys (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            api_key TEXT,
-            is_active INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS active_tasks (
-            task_id TEXT PRIMARY KEY,
-            user_id INTEGER,
-            chat_id INTEGER,
-            model TEXT,
-            prompt TEXT,
-            start_time REAL,
-            status TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_apikeys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                api_key TEXT,
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS active_tasks (
+                task_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                chat_id INTEGER,
+                model TEXT,
+                prompt TEXT,
+                start_time REAL,
+                status TEXT
+            )
+        """)
+        conn.commit()
+    except Exception as e:
+        print(f"DB Init Error: {e}")
+    finally:
+        conn.close()
 
 # Jalankan init saat file ini di-load
 init_db()
