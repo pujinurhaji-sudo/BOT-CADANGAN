@@ -398,16 +398,16 @@ async def poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_
                     async with aiofiles.open(v_file, "wb") as f: await f.write(vid_req.content)
 
                 f_size = os.path.getsize(v_file)
-                    caption = f"✨ <b>{model_name} SUKSES!</b>\n⏱ {duration}s | ⏳ {int(time.time()-start_time)}s"
-                    
-                    if f_size > 50 * 1024 * 1024:
-                        await tg_retry(bot.send_message, chat_id, f"{caption}\n\n📦 <b>File > 50MB.</b>\n📥 <a href='{vid_url}'>Klik Download Disini</a>", parse_mode="HTML")
-                    else:
-                        with open(v_file, "rb") as vf: 
-                            await tg_retry(bot.send_video, chat_id, vf, caption=caption, parse_mode="HTML")
-                    
-                    await notify_admin(bot, user_obj, model_name, prompt, "COMPLETED", task_id=task_id, vid_url=vid_url)
-                    try: os.remove(v_file)
+                caption = f"✨ <b>{model_name} SUKSES!</b>\n⏱ {duration}s | ⏳ {int(time.time()-start_time)}s"
+                
+                if f_size > 50 * 1024 * 1024:
+                    await tg_retry(bot.send_message, chat_id, f"{caption}\n\n📦 <b>File > 50MB.</b>\n📥 <a href='{vid_url}'>Klik Download Disini</a>", parse_mode="HTML")
+                else:
+                    with open(v_file, "rb") as vf: 
+                        await tg_retry(bot.send_video, chat_id, vf, caption=caption, parse_mode="HTML")
+                
+                await notify_admin(bot, user_obj, model_name, prompt, "COMPLETED", task_id=task_id, vid_url=vid_url)
+                try: os.remove(v_file)
                     except: pass
                     
                     db.increment_usage(chat_id)
