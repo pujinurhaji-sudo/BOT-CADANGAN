@@ -309,8 +309,8 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
                 await notify_admin(bot, user_obj, model_name, prompt, "STARTED", task_id=task_id)
                 await tg_retry(bot.edit_message_text, chat_id=chat_id, message_id=status_msg.message_id, text=build_progress_text("Rendering...", f"ID: <code>{task_id}</code>"), parse_mode="HTML")
                 
-                # Handover to polling function
-                asyncio.create_task(poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_id, api_key, model_version, duration))
+                # Handover to polling function (AWAIT to keep semaphore/limits active)
+                await poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_id, api_key, model_version, duration)
 
     except Exception as e:
         logger.error(f"❌ System Error: {traceback.format_exc()}")
