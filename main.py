@@ -58,6 +58,7 @@ CURRENT_RUNNING_TASKS = 0
 MAX_SAFE_CONCURRENT = 10 
 MAX_TASKS_PER_USER = 3 
 USER_TASK_COUNTS: dict[int, int] = {}
+GLOBAL_HTTP_CLIENT: httpx.AsyncClient = None
 
 TASK_SEMAPHORE = asyncio.Semaphore(MAX_SAFE_CONCURRENT)
 UPLOAD_SEMAPHORE = asyncio.Semaphore(1)
@@ -157,7 +158,7 @@ async def notify_admin(bot, user, model, prompt, status="STARTED", task_id="N/A"
         await bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="HTML", disable_web_page_preview=True)
     except: pass
 
-async def smart_upload_file(file_path: str) -> str | None:
+async def smart_upload_file(file_path: str, client: httpx.AsyncClient) -> str | None:
     filename = os.path.basename(file_path)
     ext = os.path.splitext(file_path)[1] or ".mp4"
     try:
@@ -173,9 +174,8 @@ async def smart_upload_file(file_path: str) -> str | None:
     # --- 1. CATBOX ---
     try:
         logger.info(f"🚀 Upload Catbox (Timeout 120s)...")
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post("https://catbox.moe/user/api.php", 
-                data={"reqtype": "fileupload"}, files={"fileToUpload": (f"media{ext}", content)}, headers=headers)
+        resp = await client.post("https://catbox.moe/user/api.php", 
+             data={"reqtype": "fileupload"}, files={"fileToUpload": (f"media{ext}", content)}, headers=headers)
         
         if resp.status_code == 200:
             if resp.text.startswith("http"):
@@ -190,9 +190,8 @@ async def smart_upload_file(file_path: str) -> str | None:
     # --- 2. TMPFILES (Fallback) ---
     try:
         logger.info(f"🚀 Fallback Tmpfiles (Timeout 120s)...")
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post("https://tmpfiles.org/api/v1/upload", 
-                files={"file": (filename, content)}, headers=headers)
+        resp = await client.post("https://tmpfiles.org/api/v1/upload", 
+            files={"file": (filename, content)}, headers=headers)
             
         if resp.status_code == 200:
             raw_url = resp.json().get("data", {}).get("url", "")
@@ -210,7 +209,7 @@ async def smart_upload_file(file_path: str) -> str | None:
 # =========================================================
 async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path, ignored_api_key_param, model_version, duration="5", orientation="video"):
     # ignored_api_key_param is kept for signature compatibility but unused
-    global CURRENT_RUNNING_TASKS, USER_TASK_COUNTS
+    global CURRENT_RUNNING_TASKS, USER_TASK_COUNTS, GLOBAL_HTTP_CLIENT
     bot = app.bot
     t0 = time.time()
     task_id = "PENDING"
@@ -255,8 +254,8 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
             if "motion" in model_version:
                 await tg_retry(bot.edit_message_text, chat_id=chat_id, message_id=status_msg.message_id, text=build_progress_text("Upload asset..."), parse_mode="HTML")
                 async with UPLOAD_SEMAPHORE:
-                    pub_img = await smart_upload_file(image_path)
-                    pub_vid = await smart_upload_file(video_path) if video_path else None
+                    pub_img = await smart_upload_file(image_path, GLOBAL_HTTP_CLIENT)
+                    pub_vid = await smart_upload_file(video_path, GLOBAL_HTTP_CLIENT) if video_path else None
                 
                 if not pub_img: raise Exception("Gagal Upload Gambar")
                 if video_path and not pub_vid: raise Exception("Gagal Upload Video")
@@ -269,7 +268,7 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
             elif model_version == "pixverse_v5":
                 URL_CREATE = f"{BASE_URL}/v1/ai/image-to-video/pixverse-v5"
                 URL_STATUS_TEMPLATE = f"{BASE_URL}/v1/ai/image-to-video/pixverse-v5/{{}}"
-                async with UPLOAD_SEMAPHORE: pub_img = await smart_upload_file(image_path)
+                async with UPLOAD_SEMAPHORE: pub_img = await smart_upload_file(image_path, GLOBAL_HTTP_CLIENT)
                 if not pub_img: raise Exception("Gagal Upload Gambar")
                 payload = {"prompt": prompt, "resolution": "1080p", "duration": int(duration), "image_url": pub_img, "seed": random.randint(1, 999999)}
             
@@ -292,17 +291,21 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
             
             await tg_retry(bot.edit_message_text, chat_id=chat_id, message_id=status_msg.message_id, text=build_progress_text("Mengirim ke AI..."), parse_mode="HTML")
             
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                res = None
-                for k_data in keys:
-                    active_key = k_data["api_key"]
-                    current_headers = {"x-freepik-api-key": active_key, "Content-Type": "application/json"}
-                    logger.info(f"🔄 Trying Key ID {k_data['id']} for User {chat_id}...")
-                    
-                    res = await client.post(URL_CREATE, json=payload, headers=current_headers)
-                    
-                    if res.status_code == 200:
-                        break # SUKSES!
+            # Using Global Client
+            res = None
+            for k_data in keys:
+                active_key = k_data["api_key"]
+                current_headers = {"x-freepik-api-key": active_key, "Content-Type": "application/json"}
+                logger.info(f"🔄 Trying Key ID {k_data['id']} for User {chat_id}...")
+                
+                try:
+                    res = await GLOBAL_HTTP_CLIENT.post(URL_CREATE, json=payload, headers=current_headers, timeout=120.0)
+                except Exception as e:
+                    logger.warning(f"⚠️ Request Failed Key {k_data['id']}: {e}")
+                    continue
+
+                if res.status_code == 200:
+                    break # SUKSES!
                     
                     # Cek error quota
                     raw_err = res.text.lower()
@@ -358,6 +361,7 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
             except: pass
 
 async def poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_id, api_key, model_version, duration, start_time=None):
+    global GLOBAL_HTTP_CLIENT
     if not start_time: start_time = time.time()
     
     headers = {"x-freepik-api-key": api_key, "Content-Type": "application/json"}
@@ -374,26 +378,26 @@ async def poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_
         ver = "v2-6" if "2.6" in model_version else "v2-5" if "2.5" in model_version else "v2-1"
         URL_STATUS_TEMPLATE = f"{BASE_URL}/v1/ai/image-to-video/kling-{ver}/{{}}"
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        # Loop for 60 minutes
-        for _ in range(360):
-            await asyncio.sleep(10)
-            try:
-                check = await client.get(URL_STATUS_TEMPLATE.format(task_id), headers=headers)
-                if check.status_code != 200: continue
-                data = check.json().get("data", {})
-                status = data.get("status")
+    # Using Global Client
+    # Loop for 60 minutes
+    for _ in range(360):
+        await asyncio.sleep(10)
+        try:
+            check = await GLOBAL_HTTP_CLIENT.get(URL_STATUS_TEMPLATE.format(task_id), headers=headers, timeout=60.0)
+            if check.status_code != 200: continue
+            data = check.json().get("data", {})
+            status = data.get("status")
 
-                if status == "COMPLETED":
-                    vid_url = (data.get("generated") or [{}])[0] if isinstance(data.get("generated"), list) else None
-                    if not vid_url: vid_url = (data.get("videos") or [{}])[0].get("url")
-                    
-                    v_file = f"vid_{task_id}.mp4"
-                    async with DOWNLOAD_SEMAPHORE:
-                        vid_req = await client.get(vid_url, timeout=180.0, follow_redirects=True)
-                        async with aiofiles.open(v_file, "wb") as f: await f.write(vid_req.content)
+            if status == "COMPLETED":
+                vid_url = (data.get("generated") or [{}])[0] if isinstance(data.get("generated"), list) else None
+                if not vid_url: vid_url = (data.get("videos") or [{}])[0].get("url")
+                
+                v_file = f"vid_{task_id}.mp4"
+                async with DOWNLOAD_SEMAPHORE:
+                    vid_req = await GLOBAL_HTTP_CLIENT.get(vid_url, timeout=180.0, follow_redirects=True)
+                    async with aiofiles.open(v_file, "wb") as f: await f.write(vid_req.content)
 
-                    f_size = os.path.getsize(v_file)
+                f_size = os.path.getsize(v_file)
                     caption = f"✨ <b>{model_name} SUKSES!</b>\n⏱ {duration}s | ⏳ {int(time.time()-start_time)}s"
                     
                     if f_size > 50 * 1024 * 1024:
@@ -712,9 +716,39 @@ async def run_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # MAIN
 # =========================================================
+async def main_loop(app):
+    global GLOBAL_HTTP_CLIENT
+    
+    # Init Global Client
+    GLOBAL_HTTP_CLIENT = httpx.AsyncClient(timeout=60.0, limits=httpx.Limits(max_keepalive_connections=20, max_connections=50))
+    logger.info("🚀 Global HTTP Client Initialized.")
+    
+    try:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        
+        # Resume tasks
+        asyncio.create_task(resume_pending_tasks(app))
+        
+        logger.info("🤖 Bot is running... (Press Ctrl+C to stop)")
+        
+        # Keep alive
+        stop_signal = asyncio.Future()
+        await stop_signal
+        
+    except Exception as e:
+        logger.error(f"Main Loop Error: {e}")
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await GLOBAL_HTTP_CLIENT.aclose()
+        logger.info("🛑 Global HTTP Client Closed.")
+
 def run_bot():
     t_request = HTTPXRequest(
-        connection_pool_size=8,
+        connection_pool_size=20,
         connect_timeout=30.0,
         read_timeout=30.0,
         write_timeout=30.0,
@@ -773,13 +807,13 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(start, pattern="^back_home$"))
     app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.edit_message_text(f"ID: <code>{u.effective_user.id}</code>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="back_home")]])), pattern="^show_user_id$"))
     
-    
-    logger.info("🤖 Bot is running... (Press Ctrl+C to stop)")
-    
-    # Resume tasks
-    asyncio.get_event_loop().create_task(resume_pending_tasks(app))
-    
-    app.run_polling()
+    # Execute Main Loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(main_loop(app))
+    except KeyboardInterrupt:
+        pass
 
 async def reset_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
