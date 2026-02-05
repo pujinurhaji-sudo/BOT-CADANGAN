@@ -23,6 +23,17 @@ def init_db():
             expiry_date TIMESTAMP
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS active_tasks (
+            task_id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            chat_id INTEGER,
+            model TEXT,
+            prompt TEXT,
+            start_time REAL,
+            status TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -142,5 +153,35 @@ def get_all_users():
             ORDER BY joined_at DESC
         """).fetchall()
         return rows
+    finally:
+        conn.close()
+
+def add_task(task_id: str, user_id: int, chat_id: int, model: str, prompt: str, start_time: float):
+    conn = get_connection()
+    try:
+        conn.execute("""
+            INSERT OR IGNORE INTO active_tasks (task_id, user_id, chat_id, model, prompt, start_time, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'PENDING')
+        """, (task_id, user_id, chat_id, model, prompt, start_time))
+        conn.commit()
+    except Exception as e:
+        print(f"Error add_task: {e}")
+    finally:
+        conn.close()
+
+def remove_task(task_id: str):
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM active_tasks WHERE task_id = ?", (task_id,))
+        conn.commit()
+    except Exception as e:
+        print(f"Error remove_task: {e}")
+    finally:
+        conn.close()
+
+def get_active_tasks():
+    conn = get_connection()
+    try:
+        return conn.execute("SELECT * FROM active_tasks").fetchall()
     finally:
         conn.close()

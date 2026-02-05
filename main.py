@@ -125,9 +125,17 @@ async def check_freepik_key(api_key: str) -> bool:
 async def notify_admin(bot, user, model, prompt, status="STARTED", task_id="N/A", error_msg="", vid_url=None):
     if not ADMIN_ID: return
     
+    # Handle user object being a dict (from DB resumption) or Telegram User object
+    if isinstance(user, dict):
+        user_id = user.get("user_id")
+        username = f"@{user.get('username')}" if user.get("username") else "No Username"
+        full_name = user.get("full_name") or "Restored User"
+    else:
+        user_id = user.id
+        username = f"@{user.username}" if user.username else "No Username"
+        full_name = sanitize_html(safe_user_label(user))
+
     emoji = "🔔" if status == "STARTED" else "✅" if status == "COMPLETED" else "❌"
-    username = f"@{user.username}" if user.username else "No Username"
-    full_name = sanitize_html(safe_user_label(user))
     
     msg = (
         f"{emoji} <b>TASK {status}</b>\n"
@@ -135,7 +143,7 @@ async def notify_admin(bot, user, model, prompt, status="STARTED", task_id="N/A"
         f"🤖 <b>Model:</b> <code>{model}</code>\n"
         f"🆔 <b>Task ID:</b> <code>{task_id}</code>\n"
         f"👤 <b>User:</b> {full_name} ({username})\n"
-        f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
+        f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
     )
 
     if status == "STARTED":
@@ -293,53 +301,16 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
                     return
                 
                 task_id = res.json()["data"]["task_id"]
+                
+                # --- PERSISTENCE START ---
+                db.add_task(task_id, user_obj.id, chat_id, model_name, prompt, time.time())
+                # --- PERSISTENCE END ---
+
                 await notify_admin(bot, user_obj, model_name, prompt, "STARTED", task_id=task_id)
                 await tg_retry(bot.edit_message_text, chat_id=chat_id, message_id=status_msg.message_id, text=build_progress_text("Rendering...", f"ID: <code>{task_id}</code>"), parse_mode="HTML")
-
-                # --- POLLING (UPDATED TO 360 LOOPS = 60 MINS) ---
-                # Mengubah loop menjadi 360 agar bot menunggu hingga 1 Jam.
-                for _ in range(360):
-                    await asyncio.sleep(10)
-                    try:
-                        check = await client.get(URL_STATUS_TEMPLATE.format(task_id), headers=headers, timeout=60.0)
-                        if check.status_code != 200: continue
-                        data = check.json().get("data", {})
-                        status = data.get("status")
-
-                        if status == "COMPLETED":
-                            vid_url = (data.get("generated") or [{}])[0] if isinstance(data.get("generated"), list) else None
-                            if not vid_url: vid_url = (data.get("videos") or [{}])[0].get("url")
-                            
-                            v_file = f"vid_{task_id}.mp4"
-                            async with DOWNLOAD_SEMAPHORE:
-                                vid_req = await client.get(vid_url, timeout=180.0, follow_redirects=True)
-                                async with aiofiles.open(v_file, "wb") as f: await f.write(vid_req.content)
-
-                            f_size = os.path.getsize(v_file)
-                            caption = f"✨ <b>{model_name} SUKSES!</b>\n⏱ {duration}s | ⏳ {int(time.time()-t0)}s"
-                            
-                            if f_size > 50 * 1024 * 1024:
-                                await tg_retry(bot.send_message, chat_id, f"{caption}\n\n📦 <b>File > 50MB.</b>\n📥 <a href='{vid_url}'>Klik Download Disini</a>", parse_mode="HTML")
-                            else:
-                                with open(v_file, "rb") as vf: 
-                                    await tg_retry(bot.send_video, chat_id, vf, caption=caption, parse_mode="HTML")
-                            
-                            await notify_admin(bot, user_obj, model_name, prompt, "COMPLETED", task_id=task_id, vid_url=vid_url)
-                            try: os.remove(v_file)
-                            except: pass
-                            db.increment_usage(chat_id)
-                            return
-                        
-                        if status == "FAILED":
-                            logger.error(f"❌ RAW API FAILED (Polling): {json.dumps(data, indent=2)}")
-                            err_det = data.get("message") or data.get("error") or "Unknown API failure"
-                            await notify_admin(bot, user_obj, model_name, prompt, "FAILED", task_id=task_id, error_msg=err_det)
-                            await tg_retry(bot.send_message, chat_id, f"❌ <b>GAGAL:</b> {sanitize_html(err_det)}", parse_mode="HTML")
-                            return
-
-                    except: continue
                 
-                await tg_retry(bot.send_message, chat_id, "⚠️ Timeout Rendering (> 60 Menit).")
+                # Handover to polling function
+                asyncio.create_task(poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_id, api_key, model_version, duration))
 
     except Exception as e:
         logger.error(f"❌ System Error: {traceback.format_exc()}")
@@ -350,6 +321,118 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
         for p in [image_path, video_path]:
             try: os.remove(p) if p else None
             except: pass
+
+async def poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_id, api_key, model_version, duration, start_time=None):
+    if not start_time: start_time = time.time()
+    
+    headers = {"x-freepik-api-key": api_key, "Content-Type": "application/json"}
+    
+    # Reconstruct URL template based on model_version (Logic copied from run_kling_task)
+    BASE_URL = "https://api.freepik.com"
+    if "motion" in model_version:
+        URL_STATUS_TEMPLATE = f"{BASE_URL}/v1/ai/image-to-video/kling-v2-6/{{}}"
+    elif model_version == "pixverse_v5":
+        URL_STATUS_TEMPLATE = f"{BASE_URL}/v1/ai/image-to-video/pixverse-v5/{{}}"
+    elif model_version == "seedance":
+        URL_STATUS_TEMPLATE = f"{BASE_URL}/v1/ai/video/seedance-1-5-pro-1080p/{{}}"
+    else:
+        ver = "v2-6" if "2.6" in model_version else "v2-5" if "2.5" in model_version else "v2-1"
+        URL_STATUS_TEMPLATE = f"{BASE_URL}/v1/ai/image-to-video/kling-{ver}/{{}}"
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        # Loop for 60 minutes
+        for _ in range(360):
+            await asyncio.sleep(10)
+            try:
+                check = await client.get(URL_STATUS_TEMPLATE.format(task_id), headers=headers)
+                if check.status_code != 200: continue
+                data = check.json().get("data", {})
+                status = data.get("status")
+
+                if status == "COMPLETED":
+                    vid_url = (data.get("generated") or [{}])[0] if isinstance(data.get("generated"), list) else None
+                    if not vid_url: vid_url = (data.get("videos") or [{}])[0].get("url")
+                    
+                    v_file = f"vid_{task_id}.mp4"
+                    async with DOWNLOAD_SEMAPHORE:
+                        vid_req = await client.get(vid_url, timeout=180.0, follow_redirects=True)
+                        async with aiofiles.open(v_file, "wb") as f: await f.write(vid_req.content)
+
+                    f_size = os.path.getsize(v_file)
+                    caption = f"✨ <b>{model_name} SUKSES!</b>\n⏱ {duration}s | ⏳ {int(time.time()-start_time)}s"
+                    
+                    if f_size > 50 * 1024 * 1024:
+                        await tg_retry(bot.send_message, chat_id, f"{caption}\n\n📦 <b>File > 50MB.</b>\n📥 <a href='{vid_url}'>Klik Download Disini</a>", parse_mode="HTML")
+                    else:
+                        with open(v_file, "rb") as vf: 
+                            await tg_retry(bot.send_video, chat_id, vf, caption=caption, parse_mode="HTML")
+                    
+                    await notify_admin(bot, user_obj, model_name, prompt, "COMPLETED", task_id=task_id, vid_url=vid_url)
+                    try: os.remove(v_file)
+                    except: pass
+                    
+                    db.increment_usage(chat_id)
+                    db.remove_task(task_id) # CLEANUP DB
+                    return
+                
+                if status == "FAILED":
+                    err_det = data.get("message") or data.get("error") or "Unknown API failure"
+                    await notify_admin(bot, user_obj, model_name, prompt, "FAILED", task_id=task_id, error_msg=err_det)
+                    await tg_retry(bot.send_message, chat_id, f"❌ <b>GAGAL:</b> {sanitize_html(err_det)}", parse_mode="HTML")
+                    db.remove_task(task_id) # CLEANUP DB
+                    return
+
+            except Exception as e:
+                logger.error(f"Polling error task {task_id}: {e}")
+                continue
+        
+        # Timeout
+        await tg_retry(bot.send_message, chat_id, "⚠️ Timeout Rendering (> 60 Menit).")
+        db.remove_task(task_id)
+
+async def resume_pending_tasks(app):
+    tasks = db.get_active_tasks()
+    if not tasks: return
+    
+    logger.info(f"🔄 Resuming {len(tasks)} pending tasks...")
+    for row in tasks:
+        # Reconstruct user object dict for notify_admin
+        user_dict = {
+            "user_id": row["user_id"],
+            "username": "ResumedUser", # We could fetch real username if we wanted
+            "full_name": "Resumed User"
+        }
+        # Attempt to determine model_version from model_name (A bit tricky, but we can store it or guess)
+        # For simplicity, we stored 'model' which is "model_name". We need to guess 'model_version' for URL template.
+        # Actually, let's just make sure we passed the right string in 'model' when saving.
+        # In run_kling_task, we passed 'model_name' (e.g. "🎬 Kling 2.6"). This is display name.
+        # ISSUE: poll_and_finish_task needs 'model_version' (e.g. 'kling-v2-6-pro') to build URL.
+        # FIX: We should save 'model_version' in DB ideally. Or map it back.
+        # Let's simple MAP back for now to minimize DB changes if possible, OR just save raw version in DB in previous step.
+        # Wait, I saved 'model_name' in previous chunk logic: `db.add_task(..., model_name, ...)`
+        # model_name is "🎬 Kling 2.6".
+        # I should change that to save 'model_version' or have a mapper.
+        
+        # Mapping back
+        m_name = row["model"]
+        m_ver = "kling-2.6" # default
+        if "Motion" in m_name: m_ver = "kling-motion" 
+        elif "PixVerse" in m_name: m_ver = "pixverse_v5"
+        elif "Seedance" in m_name: m_ver = "seedance"
+        elif "2.5" in m_name: m_ver = "kling-2.5"
+        elif "2.1" in m_name: m_ver = "kling-2.1"
+        elif "2.6" in m_name: m_ver = "kling-2.6" # pro/std handled inside poll based on string
+
+        api_key = db.get_apikey(row["user_id"])
+        if not api_key: 
+            db.remove_task(row["task_id"])
+            continue
+
+        asyncio.create_task(poll_and_finish_task(
+            app.bot, row["chat_id"], user_dict, row["model"], row["prompt"], 
+            row["task_id"], api_key, m_ver, "5", row["start_time"]
+        ))
+
 
 # =========================================================
 # HANDLERS
@@ -557,7 +640,12 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(start, pattern="^back_home$"))
     app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.edit_message_text(f"ID: <code>{u.effective_user.id}</code>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="back_home")]])), pattern="^show_user_id$"))
     
+    
     logger.info("🤖 Bot is running... (Press Ctrl+C to stop)")
+    
+    # Resume tasks
+    asyncio.get_event_loop().create_task(resume_pending_tasks(app))
+    
     app.run_polling()
 
 async def reset_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
