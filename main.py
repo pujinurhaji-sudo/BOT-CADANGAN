@@ -23,6 +23,15 @@ from telegram.ext import (
 
 import database as db
 
+# --- PERFORMANCE TUNING ---
+try:
+    import uvloop
+    if sys.platform != "win32":
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass
+# --------------------------
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -162,45 +171,57 @@ async def smart_upload_file(file_path: str, client: httpx.AsyncClient) -> str | 
     filename = os.path.basename(file_path)
     ext = os.path.splitext(file_path)[1] or ".mp4"
     try:
-        file_size = os.path.getsize(file_path) / 1024 / 1024
-        logger.info(f"📂 [UPLOAD] Baca file: {filename} ({file_size:.2f} MB)")
-        async with aiofiles.open(file_path, "rb") as f: content = await f.read()
+        async with aiofiles.open(file_path, "rb") as f:
+            content = await f.read()
     except Exception as e:
-        logger.error(f"❌ Gagal baca file: {e}")
+        logger.error(f"File read error: {e}")
         return None
 
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-    # --- 1. CATBOX ---
-    try:
-        logger.info(f"🚀 Upload Catbox (Timeout 120s)...")
-        resp = await client.post("https://catbox.moe/user/api.php", 
-             data={"reqtype": "fileupload"}, files={"fileToUpload": (f"media{ext}", content)}, headers=headers)
+    # --- RACE MODE: Define uploaders ---
+    async def upload_catbox():
+        try:
+            r = await client.post("https://catbox.moe/user/api.php", 
+                data={"reqtype": "fileupload"}, files={"fileToUpload": (f"media{ext}", content)}, headers=headers)
+            if r.status_code == 200 and r.text.startswith("http"):
+                logger.info(f"✅ Catbox WIN: {r.text.strip()}")
+                return r.text.strip()
+        except: pass
+        return None
+
+    async def upload_tmpfiles():
+        try:
+            r = await client.post("https://tmpfiles.org/api/v1/upload", 
+                files={"file": (filename, content)}, headers=headers)
+            if r.status_code == 200:
+                u = r.json().get("data", {}).get("url", "")
+                if u:
+                    final = u.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+                    logger.info(f"✅ Tmpfiles WIN: {final}")
+                    return final
+        except: pass
+        return None
+
+    # --- RACE START ---
+    logger.info("🏎️ Starting Race Upload (Catbox vs Tmpfiles)...")
+    tasks = [asyncio.create_task(upload_catbox()), asyncio.create_task(upload_tmpfiles())]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+    # Cancel loser
+    for p in pending: p.cancel()
+
+    # Check winner
+    for t in done:
+        res = t.result()
+        if res: return res
         
-        if resp.status_code == 200:
-            if resp.text.startswith("http"):
-                url = resp.text.strip().replace("http://", "https://")
-                logger.info(f"✅ Catbox OK: {url}")
-                return url
-            else:
-                logger.warning(f"⚠️ Catbox 200 tapi response aneh: {resp.text[:50]}")
-    except Exception as e:
-        logger.warning(f"⚠️ Catbox Error: {e}")
-
-    # --- 2. TMPFILES (Fallback) ---
-    try:
-        logger.info(f"🚀 Fallback Tmpfiles (Timeout 120s)...")
-        resp = await client.post("https://tmpfiles.org/api/v1/upload", 
-            files={"file": (filename, content)}, headers=headers)
-            
-        if resp.status_code == 200:
-            raw_url = resp.json().get("data", {}).get("url", "")
-            if raw_url:
-                direct_url = raw_url.replace("tmpfiles.org/", "tmpfiles.org/dl/").replace("http://", "https://")
-                logger.info(f"✅ Tmpfiles OK: {direct_url}")
-                return direct_url
-    except Exception as e:
-        logger.error(f"❌ Tmpfiles Error: {e}")
+    # If first finished failed, await the other
+    if pending:
+        try:
+            res = await pending.pop()
+            if res: return res
+        except: pass
 
     return None
 
@@ -379,9 +400,23 @@ async def poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_
         URL_STATUS_TEMPLATE = f"{BASE_URL}/v1/ai/image-to-video/kling-{ver}/{{}}"
 
     # Using Global Client
-    # Loop for 60 minutes
-    for _ in range(360):
-        await asyncio.sleep(10)
+    # Loop for 60 minutes with ADAPTIVE Sleep
+    # 0-30s: check every 3s
+    # 30-60s: check every 5s
+    # >60s: check every 10s
+    
+    max_time = 3600 # 60 mins
+    elapsed = float(time.time() - start_time)
+    
+    while elapsed < max_time:
+        # Adaptive Interval
+        if elapsed < 30: sleep_sec = 3
+        elif elapsed < 60: sleep_sec = 5
+        else: sleep_sec = 10
+        
+        await asyncio.sleep(sleep_sec)
+        elapsed = float(time.time() - start_time)
+        
         try:
             check = await GLOBAL_HTTP_CLIENT.get(URL_STATUS_TEMPLATE.format(task_id), headers=headers, timeout=60.0)
             if check.status_code != 200: continue
