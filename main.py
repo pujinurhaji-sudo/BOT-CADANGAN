@@ -362,7 +362,7 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
                 task_id = res.json()["data"]["task_id"]
                 
                 # --- PERSISTENCE START ---
-                db.add_task(task_id, user_obj.id, chat_id, model_name, prompt, time.time())
+                await asyncio.to_thread(db.add_task, task_id, user_obj.id, chat_id, model_name, prompt, time.time())
                 # --- PERSISTENCE END ---
 
                 await notify_admin(bot, user_obj, model_name, prompt, "STARTED", task_id=task_id)
@@ -447,15 +447,15 @@ async def poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_
                 except: 
                     pass
                 
-                db.increment_usage(chat_id)
-                db.remove_task(task_id) # CLEANUP DB
+                await asyncio.to_thread(db.increment_usage, chat_id)
+                await asyncio.to_thread(db.remove_task, task_id) # CLEANUP DB
                 return
             
             if status == "FAILED":
                 err_det = data.get("message") or data.get("error") or "Unknown API failure"
                 await notify_admin(bot, user_obj, model_name, prompt, "FAILED", task_id=task_id, error_msg=err_det)
                 await tg_retry(bot.send_message, chat_id, f"❌ <b>GAGAL:</b> {sanitize_html(err_det)}", parse_mode="HTML")
-                db.remove_task(task_id) # CLEANUP DB
+                await asyncio.to_thread(db.remove_task, task_id) # CLEANUP DB
                 return
 
         except Exception as e:
@@ -464,10 +464,10 @@ async def poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_
         
         # Timeout
         await tg_retry(bot.send_message, chat_id, "⚠️ Timeout Rendering (> 60 Menit).")
-        db.remove_task(task_id)
+        await asyncio.to_thread(db.remove_task, task_id)
 
 async def resume_pending_tasks(app):
-    tasks = db.get_active_tasks()
+    tasks = await asyncio.to_thread(db.get_active_tasks)
     if not tasks: return
     
     logger.info(f"🔄 Resuming {len(tasks)} pending tasks...")
@@ -489,9 +489,9 @@ async def resume_pending_tasks(app):
         elif "2.6" in m_name: m_ver = "kling-2.6" 
 
         # Pick ANY valid key for polling (rotation not needed for checking status, just valid auth)
-        keys = db.get_active_apikeys(row["user_id"])
+        keys = await asyncio.to_thread(db.get_active_apikeys, row["user_id"])
         if not keys: 
-            db.remove_task(row["task_id"])
+            await asyncio.to_thread(db.remove_task, row["task_id"])
             continue
         
         # Use the first available key for polling
