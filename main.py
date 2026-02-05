@@ -784,6 +784,23 @@ async def run_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================
 # MAIN
 # =========================================================
+async def heartbeat_task():
+    """Background task to keep the event loop active and prevent OS suspension."""
+    while True:
+        try:
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logger.info(f"💓 HEARTBEAT ({current_time}) - RAM: {_get_mm()}%")
+            await asyncio.sleep(1800) # Sleep 30 minutes
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Heartbeat Error: {e}")
+            await asyncio.sleep(60)
+
+def _get_mm():
+    try: return psutil.virtual_memory().percent if psutil else 0
+    except: return 0
+
 async def main_loop(app):
     global GLOBAL_HTTP_CLIENT
     
@@ -799,6 +816,9 @@ async def main_loop(app):
         # Resume tasks
         asyncio.create_task(resume_pending_tasks(app))
         
+        # Start Heartbeat
+        heartbeat = asyncio.create_task(heartbeat_task())
+
         logger.info("🤖 Bot is running... (Press Ctrl+C to stop)")
         
         # Keep alive
@@ -818,7 +838,7 @@ def run_bot():
     t_request = HTTPXRequest(
         connection_pool_size=20,
         connect_timeout=30.0,
-        read_timeout=30.0,
+        read_timeout=60.0,
         write_timeout=30.0,
         http_version="1.1"
     )
