@@ -24,6 +24,14 @@ def init_db():
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_apikeys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            api_key TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS active_tasks (
             task_id TEXT PRIMARY KEY,
             user_id INTEGER,
@@ -73,23 +81,59 @@ def register_user(user_id: int, full_name: str = "Unknown", username: str = None
     finally:
         conn.close()
 
-def set_apikey(user_id: int, api_key: str):
+    return None
+
+def add_apikey(user_id: int, api_key: str) -> bool:
     conn = get_connection()
     try:
-        conn.execute("UPDATE users SET api_key = ? WHERE user_id = ?", (api_key, user_id))
+        # Cek jumlah key saat ini
+        count = conn.execute("SELECT COUNT(*) FROM user_apikeys WHERE user_id = ?", (user_id,)).fetchone()[0]
+        if count >= 10: return False
+        
+        # Cek duplikat
+        exist = conn.execute("SELECT 1 FROM user_apikeys WHERE user_id = ? AND api_key = ?", (user_id, api_key)).fetchone()
+        if exist: return True # Anggap sukses jika sudah ada
+        
+        conn.execute("INSERT INTO user_apikeys (user_id, api_key) VALUES (?, ?)", (user_id, api_key))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def get_all_apikeys(user_id: int):
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT id, api_key FROM user_apikeys WHERE user_id = ? ORDER BY id ASC", (user_id,)).fetchall()
+        return [{"id": r["id"], "api_key": r["api_key"]} for r in rows]
+    finally:
+        conn.close()
+
+def delete_apikey(user_id: int, key_id: int):
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM user_apikeys WHERE user_id = ? AND id = ?", (user_id, key_id))
         conn.commit()
     finally:
         conn.close()
 
-def get_apikey(user_id: int):
+def migrate_keys():
+    """Pindahkan key dari tabel users ke user_apikeys (One-time run)"""
     conn = get_connection()
     try:
-        row = conn.execute("SELECT api_key FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        if row and row["api_key"]:
-            return row["api_key"]
+        users = conn.execute("SELECT user_id, api_key FROM users WHERE api_key IS NOT NULL AND api_key != ''").fetchall()
+        for u in users:
+            # Cek apakah sudah ada di tabel baru
+            exist = conn.execute("SELECT 1 FROM user_apikeys WHERE user_id = ? AND api_key = ?", (u["user_id"], u["api_key"])).fetchone()
+            if not exist:
+                conn.execute("INSERT INTO user_apikeys (user_id, api_key) VALUES (?, ?)", (u["user_id"], u["api_key"]))
+        conn.commit()
+    except Exception as e:
+        print(f"Migrate error: {e}")
     finally:
         conn.close()
-    return None
+
+# Auto migrate saat start
+migrate_keys()
 
 def check_access(user_id: int) -> bool:
     conn = get_connection()

@@ -65,7 +65,7 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
 
 # States
 SET_APIKEY_STATE, WAITING_IMAGE, WAITING_REF_VIDEO, WAITING_PROMPT, WAITING_ORIENTATION, WAITING_DURATION = range(6)
-ADMIN_SELECT, ADMIN_INPUT = range(2)
+ADMIN_SELECT, ADMIN_INPUT, DELETE_KEY_SELECT = range(3)
 
 # =========================================================
 # HELPERS
@@ -208,7 +208,8 @@ async def smart_upload_file(file_path: str) -> str | None:
 # =========================================================
 # WORKER ENGINE
 # =========================================================
-async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path, api_key, model_version, duration="5", orientation="video"):
+async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path, ignored_api_key_param, model_version, duration="5", orientation="video"):
+    # ignored_api_key_param is kept for signature compatibility but unused
     global CURRENT_RUNNING_TASKS, USER_TASK_COUNTS
     bot = app.bot
     t0 = time.time()
@@ -236,7 +237,17 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
             status_msg = await tg_retry(bot.send_message, chat_id, build_progress_text("Memulai...", f"Slot: {format_task_slot(chat_id)}"), parse_mode="HTML")
             
             BASE_URL = "https://api.freepik.com"
-            headers = {"x-freepik-api-key": api_key, "Content-Type": "application/json"}
+            
+            # --- SMART RETRY LOGIC START ---
+            keys = db.get_all_apikeys(chat_id)
+            if not keys:
+                await tg_retry(bot.send_message, chat_id, "❌ <b>Tidak ada API Key!</b>\nSilakan set key dulu.", parse_mode="HTML")
+                return
+
+            active_key = None
+            last_error = ""
+            
+            # Prepare payload once
             payload = {}
             URL_CREATE = ""
             URL_STATUS_TEMPLATE = ""
@@ -279,11 +290,32 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
 
             await tg_retry(bot.edit_message_text, chat_id=chat_id, message_id=status_msg.message_id, text=build_progress_text("Mengirim ke AI..."), parse_mode="HTML")
             
+            await tg_retry(bot.edit_message_text, chat_id=chat_id, message_id=status_msg.message_id, text=build_progress_text("Mengirim ke AI..."), parse_mode="HTML")
+            
             async with httpx.AsyncClient(timeout=300.0) as client:
-                res = await client.post(URL_CREATE, json=payload, headers=headers)
-                
-                if res.status_code != 200:
+                res = None
+                for k_data in keys:
+                    active_key = k_data["api_key"]
+                    current_headers = {"x-freepik-api-key": active_key, "Content-Type": "application/json"}
+                    logger.info(f"🔄 Trying Key ID {k_data['id']} for User {chat_id}...")
+                    
+                    res = await client.post(URL_CREATE, json=payload, headers=current_headers)
+                    
+                    if res.status_code == 200:
+                        break # SUKSES!
+                    
+                    # Cek error quota
                     raw_err = res.text.lower()
+                    if "daily limit" in raw_err or "payment" in raw_err or "quota" in raw_err or "401" in str(res.status_code) or "403" in str(res.status_code):
+                        logger.warning(f"⚠️ Key ID {k_data['id']} Limit/Expired. Switching...")
+                        continue # Coba key berikutnya
+                    
+                    # Error lain (bad request dll), jangan retry key lain, karena kemungkinan payload salah
+                    last_error = res.text
+                    break
+
+                if not res or res.status_code != 200:
+                    raw_err = res.text.lower() if res else "No Response"
                     if "daily limit" in raw_err or "payment" in raw_err or "quota" in raw_err:
                         err_msg = "⛔ <b>Kuota API Habis!</b>\nSilakan ganti API Key di menu utama."
                         admin_err = "Kuota Habis / Daily Limit"
@@ -300,6 +332,9 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
                     await tg_retry(bot.send_message, chat_id, err_msg, parse_mode="HTML")
                     return
                 
+                # Use active_key for polling
+                final_key = active_key
+                
                 task_id = res.json()["data"]["task_id"]
                 
                 # --- PERSISTENCE START ---
@@ -310,7 +345,7 @@ async def run_kling_task(app, user_obj, chat_id, prompt, image_path, video_path,
                 await tg_retry(bot.edit_message_text, chat_id=chat_id, message_id=status_msg.message_id, text=build_progress_text("Rendering...", f"ID: <code>{task_id}</code>"), parse_mode="HTML")
                 
                 # Handover to polling function (AWAIT to keep semaphore/limits active)
-                await poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_id, api_key, model_version, duration)
+                await poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_id, final_key, model_version, duration)
 
     except Exception as e:
         logger.error(f"❌ System Error: {traceback.format_exc()}")
@@ -402,17 +437,6 @@ async def resume_pending_tasks(app):
             "username": "ResumedUser", # We could fetch real username if we wanted
             "full_name": "Resumed User"
         }
-        # Attempt to determine model_version from model_name (A bit tricky, but we can store it or guess)
-        # For simplicity, we stored 'model' which is "model_name". We need to guess 'model_version' for URL template.
-        # Actually, let's just make sure we passed the right string in 'model' when saving.
-        # In run_kling_task, we passed 'model_name' (e.g. "🎬 Kling 2.6"). This is display name.
-        # ISSUE: poll_and_finish_task needs 'model_version' (e.g. 'kling-v2-6-pro') to build URL.
-        # FIX: We should save 'model_version' in DB ideally. Or map it back.
-        # Let's simple MAP back for now to minimize DB changes if possible, OR just save raw version in DB in previous step.
-        # Wait, I saved 'model_name' in previous chunk logic: `db.add_task(..., model_name, ...)`
-        # model_name is "🎬 Kling 2.6".
-        # I should change that to save 'model_version' or have a mapper.
-        
         # Mapping back
         m_name = row["model"]
         m_ver = "kling-2.6" # default
@@ -421,12 +445,16 @@ async def resume_pending_tasks(app):
         elif "Seedance" in m_name: m_ver = "seedance"
         elif "2.5" in m_name: m_ver = "kling-2.5"
         elif "2.1" in m_name: m_ver = "kling-2.1"
-        elif "2.6" in m_name: m_ver = "kling-2.6" # pro/std handled inside poll based on string
+        elif "2.6" in m_name: m_ver = "kling-2.6" 
 
-        api_key = db.get_apikey(row["user_id"])
-        if not api_key: 
+        # Pick ANY valid key for polling (rotation not needed for checking status, just valid auth)
+        keys = db.get_all_apikeys(row["user_id"])
+        if not keys: 
             db.remove_task(row["task_id"])
             continue
+        
+        # Use the first available key for polling
+        api_key = keys[0]["api_key"]
 
         asyncio.create_task(poll_and_finish_task(
             app.bot, row["chat_id"], user_dict, row["model"], row["prompt"], 
@@ -475,33 +503,83 @@ async def admin_process_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def set_apikey_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    current_key = db.get_apikey(q.from_user.id)
-    txt = "🔑 <b>Setting API Key</b>\n\n"
-    if current_key:
-        masked = f"....{current_key[-8:]}" if len(current_key) > 8 else current_key
-        txt += f"Key saat ini: <code>{masked}</code>\n\nKirim key baru atau klik Batal."
+    
+    keys = db.get_all_apikeys(q.from_user.id)
+    count = len(keys)
+    
+    txt = f"🔑 <b>Manajemen API Key</b>\n"
+    txt += f"Jumlah Key: {count}/10\n\n"
+    
+    if keys:
+        for idx, k in enumerate(keys):
+            masked = f"....{k['api_key'][-6:]}" if len(k['api_key']) > 6 else k['api_key']
+            txt += f"{idx+1}. <code>{masked}</code>\n"
     else:
-        txt += "Silakan kirimkan API Key Freepik Anda sekarang."
-    kb = [[InlineKeyboardButton("🔙 Batal", callback_data="back_home")]]
+        txt += "❌ Belum ada API Key."
+
+    kb = []
+    if count < 10:
+        kb.append([InlineKeyboardButton("➕ Tambah Key", callback_data="add_key_input")])
+    if count > 0:
+        kb.append([InlineKeyboardButton("🗑 Hapus Key", callback_data="del_key_list")])
+    kb.append([InlineKeyboardButton("🔙 Menu Utama", callback_data="back_home")])
+    
     await tg_retry(q.edit_message_text, txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    return SET_APIKEY_STATE
+
+async def del_key_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    keys = db.get_all_apikeys(q.from_user.id)
+    if not keys:
+        await q.edit_message_text("❌ Key kosong.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="menu_apikey")]]))
+        return SET_APIKEY_STATE
+        
+    kb = []
+    for k in keys:
+        masked = f"....{k['api_key'][-6:]}"
+        kb.append([InlineKeyboardButton(f"🗑 Hapus {masked}", callback_data=f"del_key_{k['id']}")])
+    kb.append([InlineKeyboardButton("🔙 Batal", callback_data="menu_apikey")])
+    
+    await q.edit_message_text("👇 <b>Pilih Key untuk dihapus:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    return DELETE_KEY_SELECT
+
+async def del_key_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        key_id = int(q.data.split("_")[-1])
+        db.delete_apikey(q.from_user.id, key_id)
+        await q.answer("✅ Key Dihapus!", show_alert=True)
+    except:
+        await q.answer("❌ Gagal.", show_alert=True)
+    return await set_apikey_start(update, context)
+
+async def ask_key_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("🔑 <b>Kirimkan API Key Freepik:</b>\n(Key akan divalidasi)", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Batal", callback_data="menu_apikey")]]))
     return SET_APIKEY_STATE
 
 async def save_apikey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api_key = update.message.text.strip()
     if len(api_key) < 5:
-        await update.message.reply_text("❌ API Key tidak valid.")
+        await update.message.reply_text("❌ Key tidak valid.")
         return SET_APIKEY_STATE
+        
     wait = await update.message.reply_text("⏳ <i>Memeriksa key...</i>", parse_mode="HTML")
     if await check_freepik_key(api_key):
-        db.set_apikey(update.effective_user.id, api_key)
-        await tg_retry(wait.edit_text, "✅ <b>Key Tersimpan!</b>\nSilakan coba generate.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Utama", callback_data="back_home")]]))
-        return ConversationHandler.END
+        if db.add_apikey(update.effective_user.id, api_key):
+             await tg_retry(wait.edit_text, "✅ <b>Key Tersimpan!</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Kembali", callback_data="menu_apikey")]]))
+        else:
+             await tg_retry(wait.edit_text, "❌ <b>Gagal!</b> Maksimal 10 Key / Sudah ada.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Kembali", callback_data="menu_apikey")]]))
     else:
-        await tg_retry(wait.edit_text, "❌ <b>Key INVALID.</b> Coba lagi.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Batal", callback_data="back_home")]]))
-        return SET_APIKEY_STATE
+        await tg_retry(wait.edit_text, "❌ <b>Key INVALID.</b> Coba lagi.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Batal", callback_data="menu_apikey")]]))
+    
+    return SET_APIKEY_STATE
 
 def build_home_keyboard(user_id: int, has_key: bool = False):
-    key_label = "🔄 Ganti API Key" if has_key else "➕ Input API Key"
+    key_label = "🔑 Atur API Key"
     kb = [[InlineKeyboardButton("🌟 PixVerse V5", callback_data="gen_pixverse_v5")],
           [InlineKeyboardButton("💃 Seedance 1.5", callback_data="gen_seedance")],
           [InlineKeyboardButton("🕺 Motion Std", callback_data="gen_motion_std"), InlineKeyboardButton("💃 Motion Pro", callback_data="gen_motion_pro")],
@@ -515,18 +593,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear() # Reset state
     u = update.effective_user
     db.register_user(u.id, safe_user_label(u), u.username)
-    has_key = bool(db.get_apikey(u.id))
-    current_key = db.get_apikey(u.id) or ""
-    masked = f".......{current_key[-8:]}" if len(current_key) > 8 else "❌ Belum diset"
+    keys = db.get_all_apikeys(u.id)
+    has_key = len(keys) > 0
+    key_info = f"{len(keys)} Key Aktif" if has_key else "❌ Belum diset"
     
-    txt = f"🤖 <b>Bot Ready</b>\nSlot: {format_task_slot(u.id)}\n🔑 Key: <code>{masked}</code>"
+    txt = f"🤖 <b>Bot Ready</b>\nSlot: {format_task_slot(u.id)}\n🔑 Info: <code>{key_info}</code>"
     func = update.callback_query.edit_message_text if update.callback_query else update.message.reply_text
     await tg_retry(func, txt, reply_markup=build_home_keyboard(u.id, has_key), parse_mode="HTML")
     return ConversationHandler.END
 
 async def pre_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not await check_auth(update) or not db.get_apikey(q.from_user.id):
+    if not await check_auth(update) or not db.get_all_apikeys(q.from_user.id):
         await q.answer("⛔ Akses Ditolak / API Key Kosong", show_alert=True)
         return ConversationHandler.END
     context.user_data.clear()
@@ -574,7 +652,7 @@ async def get_orient(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     context.user_data["orient"] = q.data.split("_")[1]
     await tg_retry(q.edit_message_text, "🚀 <b>Task Diterima!</b>", parse_mode="HTML")
-    asyncio.create_task(run_kling_task(context.application, q.from_user, q.from_user.id, context.user_data["prompt"], context.user_data["img"], context.user_data.get("vid"), db.get_apikey(q.from_user.id), context.user_data["model"], "5", context.user_data.get("orient")))
+    asyncio.create_task(run_kling_task(context.application, q.from_user, q.from_user.id, context.user_data["prompt"], context.user_data["img"], context.user_data.get("vid"), None, context.user_data["model"], "5", context.user_data.get("orient")))
     return ConversationHandler.END
 
 async def show_dur(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -587,7 +665,8 @@ async def run_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     dur = q.data.split("_")[1]
     await tg_retry(q.edit_message_text, "🚀 <b>Task Diterima!</b>", parse_mode="HTML")
-    asyncio.create_task(run_kling_task(context.application, q.from_user, q.from_user.id, context.user_data["prompt"], context.user_data["img"], None, db.get_apikey(q.from_user.id), context.user_data["model"], dur))
+    await tg_retry(q.edit_message_text, "🚀 <b>Task Diterima!</b>", parse_mode="HTML")
+    asyncio.create_task(run_kling_task(context.application, q.from_user, q.from_user.id, context.user_data["prompt"], context.user_data["img"], None, None, context.user_data["model"], dur))
     return ConversationHandler.END
 
 # =========================================================
@@ -622,7 +701,16 @@ def run_bot():
             CallbackQueryHandler(set_apikey_start, pattern="^menu_apikey$")
         ],
         states={
-            SET_APIKEY_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_apikey)],
+            SET_APIKEY_STATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_apikey),
+                CallbackQueryHandler(ask_key_input, pattern="^add_key_input$"),
+                CallbackQueryHandler(del_key_list, pattern="^del_key_list$"),
+                CallbackQueryHandler(set_apikey_start, pattern="^menu_apikey$")
+            ],
+            DELETE_KEY_SELECT: [
+                CallbackQueryHandler(del_key_exec, pattern="^del_key_"),
+                CallbackQueryHandler(set_apikey_start, pattern="^menu_apikey$")
+            ],
             WAITING_IMAGE: [MessageHandler((filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND, get_img)],
             WAITING_REF_VIDEO: [MessageHandler((filters.VIDEO | filters.Document.VIDEO) & ~filters.COMMAND, get_vid)],
             WAITING_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_prompt)],
