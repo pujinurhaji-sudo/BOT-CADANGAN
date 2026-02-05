@@ -106,7 +106,7 @@ async def check_auth(update: Update) -> bool:
     user = update.effective_user
     if not user: return False
     if is_admin(user.id): return True
-    return db.check_access(user.id)
+    return await asyncio.to_thread(db.check_access, user.id)
 
 def safe_user_label(user) -> str:
     first = (user.first_name or "").strip() or "User"
@@ -673,8 +673,11 @@ def build_home_keyboard(user_id: int, has_key: bool = False):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear() # Reset state
     u = update.effective_user
-    db.register_user(u.id, safe_user_label(u), u.username)
-    keys = db.get_all_apikeys(u.id)
+    
+    # Async DB Call
+    await asyncio.to_thread(db.register_user, u.id, safe_user_label(u), u.username)
+    keys = await asyncio.to_thread(db.get_all_apikeys, u.id)
+    
     has_key = len(keys) > 0
     key_info = f"{len(keys)} Key Aktif" if has_key else "❌ Belum diset"
     
