@@ -407,8 +407,10 @@ async def poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_
                         await tg_retry(bot.send_video, chat_id, vf, caption=caption, parse_mode="HTML")
                 
                 await notify_admin(bot, user_obj, model_name, prompt, "COMPLETED", task_id=task_id, vid_url=vid_url)
-                try: os.remove(v_file)
-                    except: pass
+                try: 
+                    os.remove(v_file)
+                except: 
+                    pass
                     
                     db.increment_usage(chat_id)
                     db.remove_task(task_id) # CLEANUP DB
