@@ -3,3 +3,4 @@ httpx
 aiofiles
 python-dotenv
 uvloop
+psutil

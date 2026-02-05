@@ -30,7 +30,13 @@ try:
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except ImportError:
     pass
-# --------------------------
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+# =========================================================
 
 # =========================================================
 # CONFIG
@@ -509,9 +515,9 @@ async def resume_pending_tasks(app):
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return ConversationHandler.END
     kb = [[InlineKeyboardButton("➕ Add User", callback_data="admin_add"), InlineKeyboardButton("➖ Del User", callback_data="admin_del")],
-          [InlineKeyboardButton("📊 List Users", callback_data="admin_list")],
+          [InlineKeyboardButton("📊 List Users", callback_data="admin_list"), InlineKeyboardButton("🖥️ Sys Stats", callback_data="admin_sys_stats")],
           [InlineKeyboardButton("❌ Close", callback_data="admin_close")]]
-    await tg_retry(update.effective_message.reply_text, "👮‍♂️ <b>ADMIN</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    await tg_retry(update.effective_message.reply_text, "👮‍♂️ <b>ADMIN PANEL</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     return ADMIN_SELECT
 
 async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -526,6 +532,26 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         msg = "📊 <b>TOP USERS:</b>\n" + "\n".join([f"• <code>{u['user_id']}</code> | {u['usage_count']}" for u in users[-50:]])
         await tg_retry(q.edit_message_text, msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="admin_home")]]), parse_mode="HTML")
         return ADMIN_SELECT
+    
+    if q.data == "admin_sys_stats":
+        if not psutil:
+            await q.answer("❌ module psutil not installed", show_alert=True)
+            return ADMIN_SELECT
+            
+        cpu = psutil.cpu_percent(interval=None)
+        ram = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        
+        msg = (
+            f"🖥️ <b>SYSTEM STATUS</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🧠 <b>CPU:</b> {cpu}%\n"
+            f"💾 <b>RAM:</b> {ram.percent}% ({ram.used // (1024*1024)}MB / {ram.total // (1024*1024)}MB)\n"
+            f"💿 <b>DISK:</b> {disk.percent}% ({disk.used // (1024*1024*1024)}GB / {disk.total // (1024*1024*1024)}GB)\n"
+        )
+        await tg_retry(q.edit_message_text, msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="admin_home")]]), parse_mode="HTML")
+        return ADMIN_SELECT
+
     if q.data in ["admin_add", "admin_del"]:
         context.user_data["mode"] = q.data
         await tg_retry(q.edit_message_text, "Kirim ID User:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="admin_home")]]))
