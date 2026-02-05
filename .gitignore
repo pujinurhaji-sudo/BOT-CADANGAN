@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.log
+.env
+*.jpg
+*.mp4
+temp_*.jpg
+img_*.jpg
+vid_*.mp4

@@ -1,0 +1,4 @@
+python-telegram-bot
+httpx
+aiofiles
+python-dotenv
