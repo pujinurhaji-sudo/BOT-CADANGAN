@@ -549,7 +549,9 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             f"💾 <b>RAM:</b> {ram.percent}% ({ram.used // (1024*1024)}MB / {ram.total // (1024*1024)}MB)\n"
             f"💿 <b>DISK:</b> {disk.percent}% ({disk.used // (1024*1024*1024)}GB / {disk.total // (1024*1024*1024)}GB)\n"
         )
-        await tg_retry(q.edit_message_text, msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="admin_home")]]), parse_mode="HTML")
+        kb = [[InlineKeyboardButton("🔄 Refresh", callback_data="admin_sys_stats")],
+              [InlineKeyboardButton("🔙 Back", callback_data="admin_home")]]
+        await tg_retry(q.edit_message_text, msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
         return ADMIN_SELECT
 
     if q.data in ["admin_add", "admin_del"]:
