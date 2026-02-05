@@ -138,8 +138,11 @@ async def check_freepik_key(api_key: str) -> bool:
     except:
         return False
 
+
+ADMIN_NOTIF_ENABLED = True
+
 async def notify_admin(bot, user, model, prompt, status="STARTED", task_id="N/A", error_msg="", vid_url=None):
-    if not ADMIN_ID: return
+    if not ADMIN_ID or not ADMIN_NOTIF_ENABLED: return
     
     # Handle user object being a dict (from DB resumption) or Telegram User object
     if isinstance(user, dict):
@@ -513,9 +516,15 @@ async def resume_pending_tasks(app):
 # HANDLERS
 # =========================================================
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global ADMIN_NOTIF_ENABLED
     if not is_admin(update.effective_user.id): return ConversationHandler.END
+    
+    notif_icon = "🔔" if ADMIN_NOTIF_ENABLED else "🔕"
+    notif_txt = "Notif: ON" if ADMIN_NOTIF_ENABLED else "Notif: OFF"
+    
     kb = [[InlineKeyboardButton("➕ Add User", callback_data="admin_add"), InlineKeyboardButton("➖ Del User", callback_data="admin_del")],
           [InlineKeyboardButton("📊 List Users", callback_data="admin_list"), InlineKeyboardButton("🖥️ Sys Stats", callback_data="admin_sys_stats")],
+          [InlineKeyboardButton(f"{notif_icon} {notif_txt}", callback_data="admin_toggle_notif")],
           [InlineKeyboardButton("❌ Close", callback_data="admin_close")]]
     await tg_retry(update.effective_message.reply_text, "👮‍♂️ <b>ADMIN PANEL</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     return ADMIN_SELECT
@@ -523,6 +532,13 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    global ADMIN_NOTIF_ENABLED
+    
+    if q.data == "admin_toggle_notif":
+        ADMIN_NOTIF_ENABLED = not ADMIN_NOTIF_ENABLED
+        # Refresh menu
+        return await admin_start(update, context)
+
     if q.data == "admin_close":
         try: await q.message.delete()
         except: pass
