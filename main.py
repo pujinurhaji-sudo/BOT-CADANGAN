@@ -411,21 +411,21 @@ async def poll_and_finish_task(bot, chat_id, user_obj, model_name, prompt, task_
                     os.remove(v_file)
                 except: 
                     pass
-                    
-                    db.increment_usage(chat_id)
-                    db.remove_task(task_id) # CLEANUP DB
-                    return
                 
-                if status == "FAILED":
-                    err_det = data.get("message") or data.get("error") or "Unknown API failure"
-                    await notify_admin(bot, user_obj, model_name, prompt, "FAILED", task_id=task_id, error_msg=err_det)
-                    await tg_retry(bot.send_message, chat_id, f"❌ <b>GAGAL:</b> {sanitize_html(err_det)}", parse_mode="HTML")
-                    db.remove_task(task_id) # CLEANUP DB
-                    return
+                db.increment_usage(chat_id)
+                db.remove_task(task_id) # CLEANUP DB
+                return
+            
+            if status == "FAILED":
+                err_det = data.get("message") or data.get("error") or "Unknown API failure"
+                await notify_admin(bot, user_obj, model_name, prompt, "FAILED", task_id=task_id, error_msg=err_det)
+                await tg_retry(bot.send_message, chat_id, f"❌ <b>GAGAL:</b> {sanitize_html(err_det)}", parse_mode="HTML")
+                db.remove_task(task_id) # CLEANUP DB
+                return
 
-            except Exception as e:
-                logger.error(f"Polling error task {task_id}: {e}")
-                continue
+        except Exception as e:
+            logger.error(f"Polling error task {task_id}: {e}")
+            continue
         
         # Timeout
         await tg_retry(bot.send_message, chat_id, "⚠️ Timeout Rendering (> 60 Menit).")
